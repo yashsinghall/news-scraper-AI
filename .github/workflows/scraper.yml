@@ -1,29 +1,34 @@
-name: News Scraper Bot
+name: Run News Scraper with logs
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours
-  workflow_dispatch:      # Allows manual trigger button
+    - cron: '0 */6 * * *'  # Run every 2 hours (Changed from 6 to match cron syntax)
+  workflow_dispatch:      # manual trigger
 
-permissions:
-  contents: write
+# Prevent multiple instances from running simultaneously
+concurrency:
+  group: news-scraper
+  cancel-in-progress: false  # Wait for previous run to complete
 
 jobs:
-  scrape:
+  scrape_news:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # Fetch all history to avoid rebase issues
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
           cache: 'pip' # Caches pip packages automatically
 
-      # --- CACHING STRATEGY FOR AI MODEL ---
-      # This prevents downloading the AI model on every run
+      # --- NEW: CACHE AI MODELS ---
+      # This is critical for sentence-transformers speed
       - name: Cache HuggingFace Models
         uses: actions/cache@v3
         with:
@@ -32,21 +37,84 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-huggingface-
 
-      - name: Install Dependencies
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Explicitly ensure these are present if requirements.txt fails
+          pip install requests beautifulsoup4 trafilatura selenium sentence-transformers
 
-      - name: Run Scraper
-        # env:
-          # If you set up a proxy secret in repo settings, uncomment below:
-          # PROXY_URL: ${{ secrets.PROXY_URL }} 
-        run: python scraper.py
+      - name: Run scraper
+        env:
+          DISPLAY: :99
+          # Uncomment if you added the proxy secret
+          # PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          # Ensure your script file is named 'news_scraper_AI.py' in the repo
+          python news_scraper_AI.py
 
-      # --- SAVE DATABASE AS ARTIFACT ---
-      # Since GitHub runners are temporary, the DB is lost unless you upload it.
-      - name: Upload Database
-        uses: actions/upload-artifact@v4
-        with:
-          name: news-database
-          path: news_articles.db
-          retention-days: 5
+      - name: Save logs with timestamp
+        run: |
+          mkdir -p logs
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          LOG_FILE="logs/scraper_${TIMESTAMP}_run${{ github.run_number }}.log"
+          
+          if [ -f news_scraper.log ]; then
+            cp news_scraper.log "$LOG_FILE"
+            echo "Log saved as $LOG_FILE"
+          else
+            echo "No log file found to save"
+          fi
+
+      - name: Commit and push updated database and logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+
+          # Stage changes
+          git add news_articles.db logs/
+
+          # Only proceed if there are changes
+          if ! git diff --staged --quiet; then
+            echo "Changes detected, committing..."
+            git commit -m "Update database and logs [skip ci]"
+            
+            # Pull latest changes with rebase strategy
+            echo "Pulling latest changes from remote..."
+            git pull --rebase origin main || {
+              echo "Rebase conflict detected, attempting to resolve..."
+              # In case of conflict, prefer our changes for db and logs
+              git checkout --ours news_articles.db logs/
+              git add news_articles.db logs/
+              git rebase --continue || echo "Manual intervention may be needed"
+            }
+            
+            # Push changes with retry logic
+            echo "Pushing changes..."
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            
+            until git push origin HEAD:main || [ $RETRY_COUNT -eq $MAX_RETRIES ]; do
+              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "Push failed, retry $RETRY_COUNT of $MAX_RETRIES..."
+              sleep 2
+              git pull --rebase origin main
+            done
+            
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+              echo "Failed to push after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            
+            echo "Successfully pushed changes"
+          else
+            echo "No changes to commit"
+          fi
