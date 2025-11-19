@@ -1,0 +1,52 @@
+name: News Scraper Bot
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs every 6 hours
+  workflow_dispatch:      # Allows manual trigger button
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip' # Caches pip packages automatically
+
+      # --- CACHING STRATEGY FOR AI MODEL ---
+      # This prevents downloading the AI model on every run
+      - name: Cache HuggingFace Models
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-huggingface-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-huggingface-
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Scraper
+        env:
+          # If you set up a proxy secret in repo settings, uncomment below:
+          # PROXY_URL: ${{ secrets.PROXY_URL }} 
+        run: python scraper.py
+
+      # --- SAVE DATABASE AS ARTIFACT ---
+      # Since GitHub runners are temporary, the DB is lost unless you upload it.
+      - name: Upload Database
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-database
+          path: news_articles.db
+          retention-days: 5
